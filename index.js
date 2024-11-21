@@ -1,31 +1,30 @@
 import Fastify from 'fastify';
 import WebSocket from 'ws';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
-
+import twilio from 'twilio';
 // Load environment variables from .env file
 dotenv.config();
 
-// Retrieve the OpenAI API key from environment variables.
-const { OPENAI_API_KEY } = process.env;
-
-if (!OPENAI_API_KEY) {
-    console.error('Missing OpenAI API key. Please set it in the .env file.');
-    process.exit(1);
-}
-
-// Initialize Fastify
-const fastify = Fastify();
-fastify.register(fastifyFormBody);
-fastify.register(fastifyWs);
+// Retrieve the OpenAI API key, Twilio Account Credentials, outgoing phone number, and public domain address from environment variables.
+const {
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  PHONE_NUMBER_FROM,
+  DOMAIN: rawDomain,
+  OPENAI_API_KEY,
+} = process.env;
 
 // Constants
-const SYSTEM_MESSAGE = 'You are a helpful and bubbly AI assistant who loves to chat about anything the user is interested about and is prepared to offer them facts. You have a penchant for dad jokes, owl jokes, and rickrolling – subtly. Always stay positive, but work in a joke when appropriate.';
-const VOICE = 'alloy';
-const PORT = process.env.PORT || 5050; // Allow dynamic port assignment
+const DOMAIN = rawDomain.replace(/(^\w+:|^)\/\//, '').replace(/\/+$/, ''); // Clean protocols and slashes
+const SYSTEM_MESSAGE = 'You are an assistant specifically for delivering bad news. Make sure you are extra dramatic to empathize with the call recipient. Use as many obscure adjectives as possible, but don\'t make the messages too long.';
+const VOICE = 'shimmer';
+const PORT = process.env.PORT || 6060; // Allow dynamic port assignment
+const outboundTwiML = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${DOMAIN}/media-stream" /></Connect></Response>`;
 
-// List of Event Types to log to the console. See the OpenAI Realtime API Documentation: https://platform.openai.com/docs/api-reference/realtime
+// List of Event Types to log to the console. See the OpenAI Realtime API Documentation.
 const LOG_EVENT_TYPES = [
     'error',
     'response.content.done',
@@ -36,42 +35,77 @@ const LOG_EVENT_TYPES = [
     'input_audio_buffer.speech_started',
     'session.created'
 ];
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !PHONE_NUMBER_FROM || !rawDomain || !OPENAI_API_KEY) {
+  console.error('One or more environment variables are missing. Please ensure TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, PHONE_NUMBER_FROM, DOMAIN, and OPENAI_API_KEY are set.');
+  process.exit(1);
+}
 
-// Show AI response elapsed timing calculations
-const SHOW_TIMING_MATH = false;
+// Function to check if a number is allowed to be called. With your own function, be sure 
+// to do your own diligence to be compliant.
+async function isNumberAllowed(to) {
+    try {
+  
+      // Uncomment these lines to test numbers. Only add numbers you have permission to call
+      const consentMap = {"+18573523420": true, "+12156005826":true}
+      if (consentMap[to]) return true;
+  
+      // Check if the number is a Twilio phone number in the account, for example, when making a call to the Twilio Dev Phone
+      const incomingNumbers = await client.incomingPhoneNumbers.list({ phoneNumber: to });
+      if (incomingNumbers.length > 0) {
+        return true;
+      }
+  
+      // Check if the number is a verified outgoing caller ID. https://www.twilio.com/docs/voice/api/outgoing-caller-ids
+      const outgoingCallerIds = await client.outgoingCallerIds.list({ phoneNumber: to });
+      if (outgoingCallerIds.length > 0) {
+        return true;
+      }
+  
+      return false;
+    } catch (error) {
+      console.error('Error checking phone number:', error);
+      return false;
+    }
+  }
+
+  // Function to make an outbound call
+async function makeCall(to) {
+    try {
+      const isAllowed = await isNumberAllowed(to);
+      if (!isAllowed) {
+        console.warn(`The number ${to} is not recognized as a valid outgoing number or caller ID.`);
+        process.exit(1);
+      }
+  
+      const call = await client.calls.create({
+        from: PHONE_NUMBER_FROM,
+        to,
+        twiml: outboundTwiML,
+      });
+      console.log(`Call started with SID: ${call.sid}`);
+    } catch (error) {
+      console.error('Error making call:', error);
+    }
+  }
+
+  // Initialize the Twilio library and set our outgoing call TwiML
+const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// Initialize Fastify
+const fastify = Fastify();
+fastify.register(fastifyFormBody);
+fastify.register(fastifyWs);
 
 // Root Route
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio Media Stream Server is running!' });
 });
 
-// Route for Twilio to handle incoming calls
-// <Say> punctuation to improve text-to-speech translation
-fastify.all('/incoming-call', async (request, reply) => {
-    const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
-                          <Response>
-                              <Say>Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Open-A.I. Realtime API</Say>
-                              <Pause length="1"/>
-                              <Say>O.K. you can start talking!</Say>
-                              <Connect>
-                                  <Stream url="wss://${request.headers.host}/media-stream" />
-                              </Connect>
-                          </Response>`;
-
-    reply.type('text/xml').send(twimlResponse);
-});
-
 // WebSocket route for media-stream
 fastify.register(async (fastify) => {
+    // Setup WebSocket server for handling media streams
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         console.log('Client connected');
-
-        // Connection-specific state
-        let streamSid = null;
-        let latestMediaTimestamp = 0;
-        let lastAssistantItem = null;
-        let markQueue = [];
-        let responseStartTimestampTwilio = null;
 
         const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
             headers: {
@@ -80,8 +114,9 @@ fastify.register(async (fastify) => {
             }
         });
 
-        // Control initial session with OpenAI
-        const initializeSession = () => {
+        let streamSid = null;
+
+        const sendInitialSessionUpdate = () => {
             const sessionUpdate = {
                 type: 'session.update',
                 session: {
@@ -98,12 +133,6 @@ fastify.register(async (fastify) => {
             console.log('Sending session update:', JSON.stringify(sessionUpdate));
             openAiWs.send(JSON.stringify(sessionUpdate));
 
-            // Uncomment the following line to have AI speak first:
-            // sendInitialConversationItem();
-        };
-
-        // Send initial conversation item if AI talks first
-        const sendInitialConversationItem = () => {
             const initialConversationItem = {
                 type: 'conversation.item.create',
                 item: {
@@ -112,63 +141,20 @@ fastify.register(async (fastify) => {
                     content: [
                         {
                             type: 'input_text',
-                            text: 'Greet the user with "Hello there! I am an AI voice assistant powered by Twilio and the OpenAI Realtime API. You can ask me for facts, jokes, or anything you can imagine. How can I help you?"'
+                            text: 'Greet the user with "Hi, my name is Alice. I\'m sorry to be the bearer of bad news, but is now a bad time to talk?"'
                         }
                     ]
                 }
             };
 
-            if (SHOW_TIMING_MATH) console.log('Sending initial conversation item:', JSON.stringify(initialConversationItem));
             openAiWs.send(JSON.stringify(initialConversationItem));
             openAiWs.send(JSON.stringify({ type: 'response.create' }));
-        };
-
-        // Handle interruption when the caller's speech starts
-        const handleSpeechStartedEvent = () => {
-            if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-                const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
-                if (SHOW_TIMING_MATH) console.log(`Calculating elapsed time for truncation: ${latestMediaTimestamp} - ${responseStartTimestampTwilio} = ${elapsedTime}ms`);
-
-                if (lastAssistantItem) {
-                    const truncateEvent = {
-                        type: 'conversation.item.truncate',
-                        item_id: lastAssistantItem,
-                        content_index: 0,
-                        audio_end_ms: elapsedTime
-                    };
-                    if (SHOW_TIMING_MATH) console.log('Sending truncation event:', JSON.stringify(truncateEvent));
-                    openAiWs.send(JSON.stringify(truncateEvent));
-                }
-
-                connection.send(JSON.stringify({
-                    event: 'clear',
-                    streamSid: streamSid
-                }));
-
-                // Reset
-                markQueue = [];
-                lastAssistantItem = null;
-                responseStartTimestampTwilio = null;
-            }
-        };
-
-        // Send mark messages to Media Streams so we know if and when AI response playback is finished
-        const sendMark = (connection, streamSid) => {
-            if (streamSid) {
-                const markEvent = {
-                    event: 'mark',
-                    streamSid: streamSid,
-                    mark: { name: 'responsePart' }
-                };
-                connection.send(JSON.stringify(markEvent));
-                markQueue.push('responsePart');
-            }
         };
 
         // Open event for OpenAI WebSocket
         openAiWs.on('open', () => {
             console.log('Connected to the OpenAI Realtime API');
-            setTimeout(initializeSession, 100);
+            setTimeout(sendInitialSessionUpdate, 100); // Ensure connection stability, send after .1 second
         });
 
         // Listen for messages from the OpenAI WebSocket (and send to Twilio if necessary)
@@ -180,6 +166,10 @@ fastify.register(async (fastify) => {
                     console.log(`Received event: ${response.type}`, response);
                 }
 
+                if (response.type === 'session.updated') {
+                    console.log('Session updated successfully:', response);
+                }
+
                 if (response.type === 'response.audio.delta' && response.delta) {
                     const audioDelta = {
                         event: 'media',
@@ -187,22 +177,6 @@ fastify.register(async (fastify) => {
                         media: { payload: Buffer.from(response.delta, 'base64').toString('base64') }
                     };
                     connection.send(JSON.stringify(audioDelta));
-
-                    // First delta from a new response starts the elapsed time counter
-                    if (!responseStartTimestampTwilio) {
-                        responseStartTimestampTwilio = latestMediaTimestamp;
-                        if (SHOW_TIMING_MATH) console.log(`Setting start timestamp for new response: ${responseStartTimestampTwilio}ms`);
-                    }
-
-                    if (response.item_id) {
-                        lastAssistantItem = response.item_id;
-                    }
-                    
-                    sendMark(connection, streamSid);
-                }
-
-                if (response.type === 'input_audio_buffer.speech_started') {
-                    handleSpeechStartedEvent();
                 }
             } catch (error) {
                 console.error('Error processing OpenAI message:', error, 'Raw message:', data);
@@ -216,28 +190,18 @@ fastify.register(async (fastify) => {
 
                 switch (data.event) {
                     case 'media':
-                        latestMediaTimestamp = data.media.timestamp;
-                        if (SHOW_TIMING_MATH) console.log(`Received media message with timestamp: ${latestMediaTimestamp}ms`);
                         if (openAiWs.readyState === WebSocket.OPEN) {
                             const audioAppend = {
                                 type: 'input_audio_buffer.append',
                                 audio: data.media.payload
                             };
+
                             openAiWs.send(JSON.stringify(audioAppend));
                         }
                         break;
                     case 'start':
                         streamSid = data.start.streamSid;
                         console.log('Incoming stream has started', streamSid);
-
-                        // Reset start and media timestamp on a new stream
-                        responseStartTimestampTwilio = null; 
-                        latestMediaTimestamp = 0;
-                        break;
-                    case 'mark':
-                        if (markQueue.length > 0) {
-                            markQueue.shift();
-                        }
                         break;
                     default:
                         console.log('Received non-media event:', data.event);
@@ -265,10 +229,27 @@ fastify.register(async (fastify) => {
     });
 });
 
+// Initialize server
 fastify.listen({ port: PORT }, (err) => {
     if (err) {
         console.error(err);
         process.exit(1);
     }
     console.log(`Server is listening on port ${PORT}`);
+
+    // Parse command-line arguments to get the phone number
+    const args = process.argv.slice(2);
+    const phoneNumberArg = args.find(arg => arg.startsWith('--call='));
+    if (!phoneNumberArg) {
+        console.error('Please provide a phone number to call, e.g., --call=+18885551212');
+        process.exit(1);
+    }
+    // console.log(
+    //     'Our recommendation is to always disclose the use of AI for outbound or inbound calls.\n'+
+    //     'Reminder: all of the rules of TCPA apply even if a call is made by AI \n' +
+    //     'Check with your counsel for legal and compliance advice.'
+    // );
+    const phoneNumberToCall = phoneNumberArg.split('=')[1].trim();
+    console.log('Calling ', phoneNumberToCall);
+    makeCall(phoneNumberToCall);
 });
