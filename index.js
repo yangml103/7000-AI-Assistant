@@ -7,6 +7,7 @@ import fastifyWs from '@fastify/websocket';
 import twilio from 'twilio';
 // Load environment variables from .env file
 dotenv.config();
+//dotenv.config({ path: '.env.numbers' }); // Load numbers .env
 
 // Retrieve the OpenAI API key, Twilio Account Credentials, outgoing phone number, and public domain address from environment variables.
 const {
@@ -19,7 +20,7 @@ const {
 
 // Constants
 const DOMAIN = rawDomain.replace(/(^\w+:|^)\/\//, '').replace(/\/+$/, ''); // Clean protocols and slashes
-const SYSTEM_MESSAGE = 'You are an assistant specifically for delivering bad news. Make sure you are extra dramatic to empathize with the call recipient. Use as many obscure adjectives as possible, but don\'t make the messages too long.';
+const SYSTEM_MESSAGE = 'You are an assistant specifically tailored to socialize with the elderly. Ask questions about them, such as name, where they live, hobbies, and be very friendly.';
 const VOICE = 'shimmer';
 const PORT = process.env.PORT || 6060; // Allow dynamic port assignment
 const outboundTwiML = `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="wss://${DOMAIN}/media-stream" /></Connect></Response>`;
@@ -44,9 +45,22 @@ if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !PHONE_NUMBER_FROM || !rawDomai
 // to do your own diligence to be compliant.
 async function isNumberAllowed(to) {
     try {
-  
-      // Uncomment these lines to test numbers. Only add numbers you have permission to call
-      const consentMap = {"+18573523420": true, "+12156005826":true}
+        console.log('Checking number:', to);
+        console.log('Environment ALLOWED_NUMBERS:', process.env.ALLOWED_NUMBERS);
+        
+        // Clean and parse the numbers properly
+        const allowedNumbers = process.env.ALLOWED_NUMBERS
+          .split(',')
+          .map(num => num.trim().replace(/['"]+/g, '')); // Remove quotes and trim whitespace
+        
+        const consentMap = allowedNumbers.reduce((acc, number) => {
+          acc[number] = true;
+          return acc;
+        }, {});
+        
+        console.log('Consent Map:', consentMap);
+      
+        
       if (consentMap[to]) return true;
   
       // Check if the number is a Twilio phone number in the account, for example, when making a call to the Twilio Dev Phone
@@ -141,7 +155,7 @@ fastify.register(async (fastify) => {
                     content: [
                         {
                             type: 'input_text',
-                            text: 'Greet the user with "Hi, my name is Alice. I\'m sorry to be the bearer of bad news, but is now a bad time to talk?"'
+                            text: 'Greet the user with "Hi, my name is Alice, it\'s nice to meet you! I am a voice assistant friend for the elderly. Can I ask what your name is?"'
                         }
                     ]
                 }
